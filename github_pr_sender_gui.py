@@ -2,8 +2,8 @@
 """
 GitHub Pull Request Sender GUI
 
-A defensive Tkinter utility that takes the contents of a local folder and opens
-(or prepares) a pull request against a GitHub repository.
+A defensive Tkinter utility that takes either a local folder or a Git patch
+(.apply/.patch/.diff) and opens a pull request against a GitHub repository.
 
 Requirements:
     - Python 3.10+
@@ -249,6 +249,386 @@ def copy_folder_contents(source: Path, destination: Path, target_subdir: str = "
 
 
 
+
+PATCH_EXTENSIONS = {".apply", ".patch", ".diff"}
+
+
+def source_kind(path: Path) -> str:
+    if path.is_dir():
+        return "folder"
+    if path.is_file() and path.suffix.lower() in PATCH_EXTENSIONS:
+        return "apply"
+    return ""
+
+
+def _decode_printf_single_quoted_payload(raw: str) -> str:
+    """Decode the POSIX-shell quote escape used by generated .apply wrappers."""
+    return raw.replace("'\\''", "'")
+
+
+def extract_patch_text(path: Path) -> str:
+    """
+    Extract a raw Git/unified patch from either a raw patch file or a generated
+    .apply wrapper. The wrapper is parsed as data; no shell code is executed.
+    """
+    try:
+        raw_bytes = path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"Could not read patch file: {exc}") from exc
+
+    if not raw_bytes:
+        raise ValueError("The selected patch file is empty.")
+
+    try:
+        payload_file = raw_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            "The selected patch file is not UTF-8 text. Binary apply wrappers are not supported."
+        ) from exc
+
+    normalized = payload_file.replace("\r\n", "\n").replace("\r", "\n")
+    stripped = normalized.lstrip()
+
+    if stripped.startswith("diff --git ") or stripped.startswith("--- "):
+        return stripped
+
+    start_match = re.search(r"printf\s+'%s'\s+'", normalized)
+    if not start_match:
+        raise ValueError(
+            "Unsupported .apply format. Expected a raw Git patch or a wrapper containing "
+            "printf '%s' '...' | git apply ..."
+        )
+
+    end_match = re.search(
+        r"'\s*\|\s*git\s+apply(?:\s+[^)]*)?\)\s*$",
+        normalized,
+        flags=re.DOTALL,
+    )
+    if not end_match or end_match.start() <= start_match.end():
+        raise ValueError("Could not locate the end of the embedded patch payload.")
+
+    encoded = normalized[start_match.end():end_match.start()]
+    patch = _decode_printf_single_quoted_payload(encoded).lstrip()
+    if not patch.startswith(("diff --git ", "--- ")):
+        raise ValueError("The .apply wrapper was found, but its payload is not a Git patch.")
+    return patch
+
+
+def patch_paths(patch_text: str) -> list[str]:
+    """Extract changed paths from Git-style diff headers."""
+    import shlex
+
+    paths: list[str] = []
+    seen: set[str] = set()
+    for line in patch_text.splitlines():
+        if not line.startswith("diff --git "):
+            continue
+        try:
+            parts = shlex.split(line[len("diff --git "):], posix=True)
+        except ValueError:
+            parts = line[len("diff --git "):].split()
+        if len(parts) < 2:
+            continue
+        candidate = parts[1]
+        if candidate.startswith(("a/", "b/")):
+            candidate = candidate[2:]
+        candidate = candidate.replace("\\", "/")
+        if candidate not in seen:
+            seen.add(candidate)
+            paths.append(candidate)
+    return paths
+
+
+def validate_patch_paths(paths: Sequence[str]) -> None:
+    for item in paths:
+        p = PurePosixPath(item)
+        if p.is_absolute() or any(part in ("", "..") for part in p.parts):
+            raise ValueError(f"Unsafe path in patch: {item}")
+        if p.parts and p.parts[0].lower() == ".git":
+            raise ValueError(f"Patch may not modify .git metadata: {item}")
+
+
+def inspect_patch_file(path: Path) -> tuple[str, list[str]]:
+    patch = extract_patch_text(path)
+    paths = patch_paths(patch)
+    if paths:
+        validate_patch_paths(paths)
+    return patch, paths
+
+
+def _rollback_patch_attempt(workdir: Path) -> None:
+    """Return the temporary clone to the branch HEAD after a failed patch attempt."""
+    run_process(["git", "reset", "--hard", "HEAD"], cwd=workdir, check=False, timeout=60)
+    run_process(["git", "clean", "-fd"], cwd=workdir, check=False, timeout=60)
+
+
+def _unmerged_paths(workdir: Path) -> list[str]:
+    """Return paths currently left in a Git merge-conflict state."""
+    result = run_process(
+        ["git", "diff", "--name-only", "--diff-filter=U", "-z"],
+        cwd=workdir,
+        check=False,
+        timeout=60,
+    )
+    if not result.stdout:
+        return []
+    return [p for p in result.stdout.split("\0") if p]
+
+
+def _has_stage(workdir: Path, path: str, stage: int) -> bool:
+    """Check whether an unmerged path has the requested index stage."""
+    result = run_process(
+        ["git", "ls-files", "-u", "--", path],
+        cwd=workdir,
+        check=False,
+        timeout=60,
+    )
+    for line in result.stdout.splitlines():
+        # Format: <mode> <object> <stage>\t<path>
+        head = line.split("\t", 1)[0].split()
+        if len(head) >= 3:
+            try:
+                if int(head[2]) == stage:
+                    return True
+            except ValueError:
+                pass
+    return False
+
+
+def _resolve_three_way_conflicts_with_patch(
+    workdir: Path,
+    conflicts: Sequence[str],
+    logger=None,
+) -> None:
+    """
+    Resolve conflicts created by `git apply --3way` by choosing the patch side
+    ("theirs") only for the paths that actually conflict.
+
+    Cleanly merged files are left untouched. For a deletion conflict where the
+    patch side has no stage-3 blob, the patch's deletion is accepted.
+    """
+    if logger:
+        logger(
+            f"Auto-fix: {len(conflicts)} file(s) need conflict resolution. "
+            "Using the patch version only for those conflicting files."
+        )
+
+    for path in conflicts:
+        if _has_stage(workdir, path, 3):
+            result = run_process(
+                ["git", "checkout", "--theirs", "--", path],
+                cwd=workdir,
+                check=False,
+                timeout=60,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Could not select the patch version for conflicted file: {path}\n"
+                    f"{(result.stderr or result.stdout).strip()}"
+                )
+            run_process(["git", "add", "--", path], cwd=workdir, timeout=60)
+            if logger:
+                logger(f"  resolved with patch version: {path}")
+        else:
+            # No stage 3 means the patch side deleted the path.
+            result = run_process(
+                ["git", "rm", "-f", "--ignore-unmatch", "--", path],
+                cwd=workdir,
+                check=False,
+                timeout=60,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Could not accept the patch deletion for conflicted file: {path}\n"
+                    f"{(result.stderr or result.stdout).strip()}"
+                )
+            if logger:
+                logger(f"  resolved with patch deletion: {path}")
+
+    remaining = _unmerged_paths(workdir)
+    if remaining:
+        raise RuntimeError(
+            "Some patch conflicts could not be resolved automatically:\n"
+            + "\n".join(f"  {p}" for p in remaining[:30])
+        )
+
+
+def _compact_git_apply_error(detail: str, limit: int = 20) -> str:
+    """
+    Keep only the useful end of git-apply diagnostics so a popup is not filled
+    with hundreds of successful 'Applied patch ... cleanly' lines.
+    """
+    lines = [line.strip() for line in detail.splitlines() if line.strip()]
+    if not lines:
+        return "git apply failed"
+
+    important = [
+        line for line in lines
+        if (
+            "error:" in line.lower()
+            or "conflict" in line.lower()
+            or "failed" in line.lower()
+            or "does not apply" in line.lower()
+            or "does not exist" in line.lower()
+            or "already exists" in line.lower()
+        )
+    ]
+    chosen = important[-limit:] if important else lines[-limit:]
+    return "\n".join(chosen)
+
+
+def apply_patch_safely(
+    source: Path,
+    workdir: Path,
+    scratch_dir: Path,
+    auto_fix: bool,
+    logger=None,
+) -> list[str]:
+    """
+    Apply .apply/.patch/.diff input without executing its shell wrapper.
+
+    Strategy:
+      1. Parse and path-check the patch.
+      2. Run a real `git apply --3way` (not `--check`).
+      3. If Git creates merge conflicts and Auto-fix is enabled, keep every
+         clean three-way merge and choose the patch side only for conflicted
+         paths.
+      4. If no usable 3-way state was produced, roll back and try ordinary
+         apply modes.
+    """
+    patch, paths = inspect_patch_file(source)
+    patch_file = scratch_dir / "incoming-change.patch"
+    patch_file.write_text(patch, encoding="utf-8", newline="\n")
+
+    if logger:
+        if paths:
+            logger(f"Patch contains changes for {len(paths)} path(s).")
+            for item in paths[:20]:
+                logger(f"  patch: {item}")
+            if len(paths) > 20:
+                logger(f"  ... and {len(paths) - 20} more path(s)")
+        else:
+            logger("Patch uses unified-diff format; Git will determine the affected paths.")
+
+    failures: list[str] = []
+
+    # ------------------------------------------------------------------
+    # First choice: a real 3-way apply.
+    #
+    # Important: do NOT use `git apply --check --3way` here. A check returns
+    # failure for the whole patch if even one path conflicts, even though Git
+    # can successfully merge most other paths and can expose a resolvable
+    # conflict state for the remaining ones.
+    # ------------------------------------------------------------------
+    if logger:
+        logger("Trying 3-way patch application...")
+
+    three_way = run_process(
+        ["git", "apply", "--3way", "--whitespace=nowarn", str(patch_file)],
+        cwd=workdir,
+        check=False,
+        timeout=300,
+    )
+
+    if three_way.returncode == 0:
+        if logger:
+            logger("OK: patch applied cleanly with a 3-way merge.")
+        return paths
+
+    three_way_detail = (three_way.stderr or three_way.stdout).strip()
+    conflicts = _unmerged_paths(workdir)
+
+    if conflicts:
+        if logger:
+            logger(
+                f"3-way apply produced {len(conflicts)} conflict(s), while other "
+                "files were applied/merged successfully."
+            )
+            for item in conflicts[:30]:
+                logger(f"  conflict: {item}")
+            if len(conflicts) > 30:
+                logger(f"  ... and {len(conflicts) - 30} more conflict(s)")
+
+        if auto_fix:
+            try:
+                _resolve_three_way_conflicts_with_patch(workdir, conflicts, logger=logger)
+
+                # Make sure the repository is no longer in an unmerged state.
+                remaining = _unmerged_paths(workdir)
+                if remaining:
+                    raise RuntimeError(
+                        "Unresolved conflicts remain:\n"
+                        + "\n".join(f"  {p}" for p in remaining[:30])
+                    )
+
+                if logger:
+                    logger(
+                        "OK: 3-way conflicts were automatically resolved. "
+                        "Clean merges were preserved; only conflicting paths used "
+                        "the patch version."
+                    )
+                return paths
+            except Exception as exc:
+                failures.append(f"3-way conflict auto-fix: {exc}")
+                if logger:
+                    logger(f"3-way conflict auto-fix failed: {exc}")
+                _rollback_patch_attempt(workdir)
+        else:
+            failures.append(
+                "3-way apply created conflicts:\n"
+                + "\n".join(f"  {p}" for p in conflicts[:30])
+            )
+            _rollback_patch_attempt(workdir)
+    else:
+        failures.append(
+            "3-way apply: " + _compact_git_apply_error(three_way_detail)
+        )
+        _rollback_patch_attempt(workdir)
+
+    # ------------------------------------------------------------------
+    # Fallbacks for patches that cannot form a 3-way state.
+    # Ordinary git apply is atomic in the normal failure case; we still reset
+    # between attempts defensively.
+    # ------------------------------------------------------------------
+    attempts: list[tuple[str, list[str]]] = [
+        ("normal apply", ["--whitespace=nowarn"]),
+    ]
+    if auto_fix:
+        attempts.append(
+            (
+                "whitespace-tolerant apply",
+                ["--ignore-space-change", "--ignore-whitespace", "--whitespace=nowarn"],
+            )
+        )
+
+    for description, options in attempts:
+        if logger:
+            logger(f"Trying {description}...")
+
+        applied = run_process(
+            ["git", "apply", *options, str(patch_file)],
+            cwd=workdir,
+            check=False,
+            timeout=300,
+        )
+        if applied.returncode == 0:
+            if logger:
+                logger(f"OK: patch applied using {description}.")
+            return paths
+
+        detail = (applied.stderr or applied.stdout).strip()
+        failures.append(f"{description}: {_compact_git_apply_error(detail)}")
+        _rollback_patch_attempt(workdir)
+
+    # Keep the popup concise; the full detailed progress remains in the GUI log.
+    summary = "\n\n".join(failures[-3:])
+    raise RuntimeError(
+        "The .apply/patch file could not be applied to the selected base branch."
+        + (f"\n\n{summary}" if summary else "")
+        + "\n\nThe complete Git output is available in the Progress / output panel."
+    )
+
+
 def create_gh_askpass(root: Path) -> tuple[Path, dict[str, str]]:
     """
     Create a temporary Git ask-pass helper that obtains the token directly from
@@ -342,6 +722,7 @@ def robust_rmtree(path: Path, logger=None, attempts: int = 6) -> bool:
 @dataclass(frozen=True)
 class PRConfig:
     source: Path
+    source_kind: str
     username: str
     target_repo: str
     base: str
@@ -396,9 +777,12 @@ class PRApp(tk.Tk):
         form.columnconfigure(1, weight=1)
 
         row = 0
-        ttk.Label(form, text="Folder to send:").grid(row=row, column=0, sticky="w", pady=5)
+        ttk.Label(form, text="Source folder / patch:").grid(row=row, column=0, sticky="w", pady=5)
         ttk.Entry(form, textvariable=self.folder_var).grid(row=row, column=1, sticky="ew", padx=8)
-        ttk.Button(form, text="Browse...", command=self.choose_folder).grid(row=row, column=2)
+        source_buttons = ttk.Frame(form)
+        source_buttons.grid(row=row, column=2, sticky="w")
+        ttk.Button(source_buttons, text="Folder...", command=self.choose_folder).pack(side="left")
+        ttk.Button(source_buttons, text=".apply...", command=self.choose_apply_file).pack(side="left", padx=(5, 0))
         row += 1
 
         ttk.Label(form, text="GitHub username:").grid(row=row, column=0, sticky="w", pady=5)
@@ -447,7 +831,7 @@ class PRApp(tk.Tk):
         opts.grid(row=row, column=1, columnspan=2, sticky="w", padx=8, pady=4)
         ttk.Checkbutton(opts, text="Create as draft PR", variable=self.draft_var).pack(side="left", padx=(0, 16))
         ttk.Checkbutton(opts, text="Keep temporary clone", variable=self.keep_temp_var).pack(side="left", padx=(0, 16))
-        ttk.Checkbutton(opts, text="Auto-fix common errors", variable=self.auto_fix_var).pack(side="left")
+        ttk.Checkbutton(opts, text="Auto-fix errors / patch conflicts", variable=self.auto_fix_var).pack(side="left")
 
         action = ttk.Frame(outer)
         action.pack(fill="x", pady=(12, 8))
@@ -475,6 +859,26 @@ class PRApp(tk.Tk):
         folder = filedialog.askdirectory()
         if folder:
             self.folder_var.set(folder)
+
+    def choose_apply_file(self) -> None:
+        filename = filedialog.askopenfilename(
+            title="Choose .apply / patch file",
+            filetypes=[
+                ("Apply and patch files", "*.apply *.patch *.diff"),
+                ("Apply files", "*.apply"),
+                ("Patch files", "*.patch *.diff"),
+                ("All files", "*.*"),
+            ],
+        )
+        if filename:
+            self.folder_var.set(filename)
+            self.dest_var.set("")
+            name = Path(filename).name
+            if self.commit_var.get().strip() == DEFAULT_COMMIT:
+                self.commit_var.set(f"Apply changes from {name}")
+            if self.title_var.get().strip() == DEFAULT_PR_TITLE:
+                self.title_var.set(f"Apply changes from {name}")
+            self.append_log(f"Selected patch source: {filename}")
 
     def append_log(self, text: str) -> None:
         def do_append() -> None:
@@ -515,12 +919,19 @@ class PRApp(tk.Tk):
         title = self.title_var.get().strip()
         body = self.body_text.get("1.0", "end-1c").strip()
 
-        if not source_text or not source.is_dir():
-            raise ValueError("Choose a valid source folder.")
+        kind = source_kind(source) if source_text else ""
+        if not source_text or not kind:
+            raise ValueError("Choose a valid source folder or a .apply/.patch/.diff file.")
         if not os.access(source, os.R_OK):
-            raise ValueError("The selected source folder is not readable.")
-        if not folder_has_payload(source):
+            raise ValueError("The selected source is not readable.")
+        if kind == "folder" and not folder_has_payload(source):
             raise ValueError("The selected source folder contains no files to send.")
+        if kind == "apply" and source.stat().st_size == 0:
+            raise ValueError("The selected patch file is empty.")
+        if kind == "apply" and destination:
+            destination = ""
+            self.dest_var.set("")
+            self.append_log("Auto-fix: destination subfolder is ignored for patch files.")
         if require_repo and not target_repo:
             raise ValueError("Enter a target GitHub repository.")
         if not commit:
@@ -534,6 +945,7 @@ class PRApp(tk.Tk):
 
         return PRConfig(
             source=source,
+            source_kind=kind,
             username=username,
             target_repo=target_repo,
             base=base,
@@ -614,8 +1026,22 @@ class PRApp(tk.Tk):
         self.append_log(f"OK: {git_v}")
         self.append_log(f"OK: {gh_v}")
 
-        files, dirs = count_payload(cfg.source)
-        self.append_log(f"OK: source is readable ({files} files, {dirs} folders).")
+        if cfg.source_kind == "folder":
+            files, dirs = count_payload(cfg.source)
+            self.append_log(f"OK: source folder is readable ({files} files, {dirs} folders).")
+        else:
+            patch_text, paths = inspect_patch_file(cfg.source)
+            size_kib = cfg.source.stat().st_size / 1024.0
+            if paths:
+                self.append_log(
+                    f"OK: patch file is readable ({size_kib:.1f} KiB, {len(paths)} changed path(s))."
+                )
+            else:
+                self.append_log(
+                    f"OK: patch file is readable ({size_kib:.1f} KiB, unified-diff format)."
+                )
+            if not patch_text.strip():
+                raise RuntimeError("The selected patch contains no patch data.")
 
         # Verify we can create/write/remove a temp directory before cloning.
         probe_root = Path(tempfile.mkdtemp(prefix="github_pr_sender_probe_"))
@@ -802,7 +1228,9 @@ class PRApp(tk.Tk):
         auth_env: dict[str, str] | None = None
         try:
             self.append_log("=" * 72)
-            self.append_log(f"Source folder: {cfg.source}")
+            self.append_log(
+                f"Source {'folder' if cfg.source_kind == 'folder' else 'patch file'}: {cfg.source}"
+            )
             self.append_log(f"Target: {cfg.target_repo}")
 
             # Full preflight: local tools, auth, repository, base branch.
@@ -866,14 +1294,30 @@ class PRApp(tk.Tk):
             self.set_status("Creating branch...")
             run_process(["git", "checkout", "-b", branch], cwd=workdir)
 
-            self.set_status("Copying files...")
-            self.append_log("Copying folder contents to " + (f"'{cfg.destination}'..." if cfg.destination else "repository root..."))
-            copy_folder_contents(cfg.source, workdir, cfg.destination)
+            if cfg.source_kind == "folder":
+                self.set_status("Copying files...")
+                self.append_log(
+                    "Copying folder contents to "
+                    + (f"'{cfg.destination}'..." if cfg.destination else "repository root...")
+                )
+                copy_folder_contents(cfg.source, workdir, cfg.destination)
+            else:
+                self.set_status("Checking and applying patch...")
+                self.append_log(
+                    "Safely parsing .apply/patch file. The shell wrapper will NOT be executed."
+                )
+                apply_patch_safely(
+                    cfg.source,
+                    workdir,
+                    temp_root,
+                    cfg.auto_fix,
+                    logger=self.append_log,
+                )
 
             self.set_status("Checking changes...")
             status = run_process(["git", "status", "--porcelain"], cwd=workdir)
             if not status.stdout.strip():
-                raise RuntimeError("The selected folder produced no changes compared with the target repository.")
+                raise RuntimeError("The selected source produced no changes compared with the target repository.")
             self.append_log("Changes detected:")
             for line in status.stdout.splitlines():
                 self.append_log("  " + line)
@@ -967,7 +1411,13 @@ class PRApp(tk.Tk):
             self.append_log(f"ERROR: {exc}")
             self.append_log(self.human_error_hint(str(exc)))
             self.set_status("Failed")
-            self.after(0, lambda e=str(exc): messagebox.showerror("Pull request failed", e))
+            self.after(
+                0,
+                lambda e=str(exc): messagebox.showerror(
+                    "Pull request failed",
+                    e if len(e) <= 5000 else e[:4800] + "\n\n[Message shortened; see Progress / output for full details.]",
+                ),
+            )
         finally:
             if temp_root is not None:
                 if cfg.keep_temp:
@@ -984,6 +1434,12 @@ class PRApp(tk.Tk):
     @staticmethod
     def human_error_hint(message: str) -> str:
         s = message.lower()
+        if "could not be applied to the selected base branch" in s or "patch failed" in s:
+            return (
+                "Hint: verify that the target repository and base branch are the ones "
+                "the .apply file was created from. The app already tries 3-way and "
+                "safe whitespace-tolerant fallbacks."
+            )
         if "could not read username" in s or "terminal prompts disabled" in s:
             return (
                 "Hint: Git did not receive GitHub credentials. This version automatically uses "
